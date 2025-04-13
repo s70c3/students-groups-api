@@ -3,6 +3,8 @@ from sqlalchemy import Column, Integer, String, ForeignKey, create_engine
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base, Session
 from typing import Optional, List
 from pydantic import BaseModel
+from fastapi import status
+from fastapi.responses import JSONResponse
 import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/postgres")
@@ -58,6 +60,14 @@ class GroupOut(BaseModel):
         from_attributes = True
 
 GroupOut.model_rebuild()
+
+class GroupFlatOut(BaseModel):
+    id: int
+    name: str
+
+    class Config:
+        from_attributes = True
+
 
 class StudentBase(BaseModel):
     name: str
@@ -135,41 +145,31 @@ def create_group(group: GroupCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_group)
     return db_group
-
-
-from sqlalchemy.orm import selectinload
-
-from sqlalchemy.orm import selectinload
-
-@app.get("/groups", response_model=List[GroupOut])
+@app.get("/groups")
 def get_groups(query: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    # Получаем все группы из базы
-    q = db.query(Group)
     if query:
-        q = q.filter(Group.name.ilike(f"%{query}%"))
-    all_groups = q.all()
+        # Поиск по имени (плоский список)
+        results = db.query(Group).filter(Group.name.ilike(f"%{query}%")).all()
+        return JSONResponse(content=[{"id": g.id, "name": g.name} for g in results])
 
+    # Полное дерево
+    groups = db.query(Group).all()
     # Группируем по parent_id
     from collections import defaultdict
 
+    # Группировка: parent_id → [subgroups]
     children_map = defaultdict(list)
-    group_map = {}
-
-    for group in all_groups:
-        group_map[group.id] = group
+    for group in groups:
         children_map[group.parent_id].append(group)
 
-    # Строим дерево вручную
     def build_tree(group: Group) -> GroupOut:
-        children = children_map.get(group.id, [])
         return GroupOut(
             id=group.id,
             name=group.name,
             parent_id=group.parent_id,
-            subGroups=[build_tree(child) for child in children]
+            subGroups=[build_tree(child) for child in children_map.get(group.id, [])]
         )
 
-    # Возвращаем только корневые группы
     roots = children_map[None]
     return [build_tree(root) for root in roots]
 
@@ -182,29 +182,58 @@ def get_group(group_id: int, db: Session = Depends(get_db)):
     return group
 
 @app.put("/groups/{group_id}", response_model=GroupOut)
-def update_group(group_id: int, group: GroupCreate, db: Session = Depends(get_db)):
+def update_group(group_id: int, group: GroupOut, db: Session = Depends(get_db)):
+    if group.id != group_id:
+        raise HTTPException(
+            status_code=400,
+            detail="ID in path and body must match"
+        )
+
     db_group = db.query(Group).filter(Group.id == group_id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Group not found")
-    data = group.dict()
-    if data["parent_id"] == 0:
-        data["parent_id"] = None
-    for field, value in data.items():
-        setattr(db_group, field, value)
+
+    # Нельзя быть родителем самому себе
+    if group.parent_id == group_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Group cannot be its own parent"
+        )
+
+    # Если указан parent_id — проверим его существование
+    if group.parent_id is not None:
+        parent = db.query(Group).filter(Group.id == group.parent_id).first()
+        if not parent:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Parent group with id {group.parent_id} not found"
+            )
+
+    db_group.name = group.name
+    db_group.parent_id = group.parent_id
     db.commit()
+    db.refresh(db_group)
     return db_group
 
 
-@app.delete("/groups/{group_id}")
+
+@app.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_group(group_id: int, db: Session = Depends(get_db)):
     group = db.query(Group).filter(Group.id == group_id).first()
+
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
-    if group.subgroups:
-        raise HTTPException(status_code=400, detail="Cannot delete group with subgroups")
+
+    # Проверка: есть ли подгруппы
+    has_children = db.query(Group).filter(Group.parent_id == group_id).first()
+    if has_children:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete group with existing subgroups"
+        )
+
     db.delete(group)
     db.commit()
-    return {"message": "Group deleted"}
 
 # Create tables
 Base.metadata.create_all(bind=engine)
